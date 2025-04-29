@@ -1,0 +1,597 @@
+---
+title: "data_merging/cleaning"
+output: html_document
+date: "2025-03-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(fuzzyjoin)
+library(tidyverse)
+library(plotly)
+library(janitor)
+library(corrplot)
+library(fastDummies)
+library(mice)
+library(naniar)
+library(car)
+library(glmnet)
+library(lme4)
+library(caret)
+library(broom)
+library(ggplot2)
+library(purrr)
+```
+
+
+
+read files
+```{r}
+player_play <- read.csv('data/BDB-2025-data/player_play.csv')
+players <- read.csv('data/BDB-2025-data/players.csv')
+plays <- read.csv('data/BDB-2025-data/plays.csv')
+combine <- read.csv('data/filtered_combine.csv')
+```
+
+get all route runners from weeks 1-9
+```{r}
+player_play |> 
+  filter(
+    !is.na(wasRunningRoute),
+    wasRunningRoute == 1
+  ) |>
+  dplyr::select(nflId) |> 
+  group_by(nflId) |> 
+  summarize(n_routes = n()) |> 
+  left_join(
+    y = players,
+    by = "nflId"
+  ) -> route_runners
+
+
+write.csv(route_runners %>% select(nflId), "data/route_runner_Ids.csv", row.names = FALSE)
+```
+
+
+
+all route runners + combine stats 
+```{r}
+
+route_runners <- route_runners %>%
+  separate(height, into = c("feet", "inches"), sep = "-", convert = TRUE) %>%
+  mutate(total_inches = feet * 12 + inches) %>%
+  select(-feet, -inches)
+
+
+
+# TODO need to impute here, can still check things on original data below but imputating should happen before filtering
+
+scaled_combine <- combine %>% mutate_at(c("X40yd","X3Cone","Shuttle"), ~(scale(.) %>% as.vector))
+
+route_runners_combine <- stringdist_left_join(
+  x = route_runners,
+  y = scaled_combine,
+  by = c('displayName' = 'Player'),
+  distance_col = 'string_dist') %>%
+  select(nflId,n_routes,position,displayName, weight, X40yd, X3Cone, Shuttle, total_inches) %>% 
+  filter(position %in% c("TE","RB","WR"))
+
+route_runners_combine <- route_runners_combine %>% mutate_at(c("weight","total_inches"), ~(scale(.) %>% as.vector))
+
+route_runners_combine <- dummy_cols(route_runners_combine, select_columns = "position", remove_first_dummy = F, remove_selected_columns = T)
+```
+
+
+looking at how missing values correlate with players performance (measured by number of routes ran)
+```{r}
+
+colMeans(is.na(route_runners_combine %>% select(c("X40yd","X3Cone","Shuttle"))))
+# missing % for all route runners
+#    X40yd    X3Cone   Shuttle 
+#0.3453390 0.5741525 0.5466102 
+colMeans(is.na(two_missing_max %>% select(c("X40yd","X3Cone","Shuttle"))))
+# missing % for route runners missing at most speed times
+#     X40yd     X3Cone    Shuttle 
+#0.01592357 0.35987261 0.31847134 
+
+count(two_missing_max) / count(route_runners_combine)
+# in the end we are dropping 1/3 of our players
+
+
+# all players with missing values
+# 279
+any_missing_values <- route_runners_combine %>% filter(if_any(everything(), is.na))
+count(any_missing_values) / count(route_runners_combine) 
+# 59% of players have at least one missing value
+
+# players with no missing values
+# 193
+full_data_players <- route_runners_combine %>% drop_na()
+count(full_data_players) / count(route_runners_combine)
+# 41% of players have no missing values
+
+
+# players with 2 or less missing values
+# 314
+two_missing_max <- route_runners_combine %>% filter(rowSums(is.na(select(.,"X40yd","X3Cone","Shuttle"))) <= 2)
+count(two_missing_max) / count(route_runners_combine)
+# 67% of players have 
+
+# players with no combine speed stats
+# 158
+all_missing <- route_runners_combine %>% filter(rowSums(is.na(select(.,"X40yd","X3Cone","Shuttle"))) == 3)
+count(all_missing) / count(route_runners_combine)
+# 33% missing
+
+
+df1 <- route_runners_combine %>% select(n_routes) %>% mutate(cat = 'all players')
+df2 <- full_data_players %>% select(n_routes) %>% mutate(cat = "0 missing")
+df4 <- two_missing_max %>% select(n_routes) %>% mutate(cat = "up to 2 missing")
+df5 <- all_missing %>% select(n_routes) %>%  mutate(cat = "all 3 missing")
+df3 <- any_missing_values %>% select(n_routes) %>% mutate(cat = "at least one missing")
+
+
+df_combined <- bind_rows(df2,df4,df5,df3)
+                         
+df_combined$cat <- factor(df_combined$cat, levels = c("0 missing", "up to 2 missing", 'all 3 missing',"at least one missing"))
+
+# Create the violin plot
+p = ggplot(df_combined, aes(x = cat, y = n_routes, fill = cat)) +
+  geom_violin(trim = FALSE) + 
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_minimal() +
+  labs(title = "Missing Speed Combine Stats vs Reciever Preformance", y = "Preformance (num routes)", x = "Number of missing combine speed stats") +
+  theme(legend.position = "none")
+
+p
+
+ggsave("Pre Exploratory Graphs/Effects of missing combine values on preformance.png", plot = p, width = 8, height = 6, dpi = 300)
+```
+we see that players that are missing 2 values or less have a very similar distribution of number of routes ran as players that have no missing values
+
+```{r}
+
+all_players <- as.numeric(unlist(df1['n_routes']))
+full_combine_players <- as.numeric(unlist(df2['n_routes']))
+missing_2_max_combine <- as.numeric(unlist(df4['n_routes']))
+all_missing_players <- as.numeric(unlist(df5['n_routes']))
+missing_value_players <- as.numeric(unlist(df3["n_routes"]))
+
+
+hist(all_players)
+hist(full_combine_players)
+hist(missing_2_max_combine)
+hist(all_missing_players)
+hist(missing_value_players)
+
+wilcox.test(full_combine_players, missing_2_max_combine, paired = FALSE)
+
+wilcox.test(full_combine_players, missing_value_players, paired = FALSE)
+
+wilcox.test(full_combine_players, all_missing_players, paired = FALSE)
+
+
+```
+we see that there is not a statistically significant difference in the number of routes ran (and by proxy receiver performance) between players with all speed combine stats recorded and players with missing a max of 2 speed combine stats recorded. however there is a statistically significant difference in the number of routes ran (and by proxy receiver performance) between players with all speed combine stats recorded and players with 0 speed combine stats recorded.
+
+
+
+
+when imputing data we want to impute as little of our data as we can, if we use the all players we will be imputing a lot of data, for example 57% of the 3 cone data. however if we limit ourselves to players missing 2 drills we can limit how much data has to be imputed by almost 2/3s.
+```{r}
+
+mcar_test(two_missing_max %>% select(c('weight','X40yd','X3Cone','Shuttle','total_inches')))
+
+
+imputed_df <- mice(two_missing_max %>% select(c('weight','X40yd','X3Cone','Shuttle','total_inches')), method = "norm.predict")
+plot(imputed_df)
+densityplot(imputed_df)
+
+imputed_rr_combine <- complete(imputed_df)
+
+#merge back all other variables not used in imputation
+imputed_rr_combine <- (cbind(two_missing_max %>% select(-c('weight','X40yd','X3Cone','Shuttle','total_inches')),imputed_rr_combine))
+
+```
+in the MCAR test we get a high p value (.35) so can say we have significant evidence to say our data is 'Missing Completely at Random'
+
+
+
+
+looking at how values (and missing values) may be correlated in the full data, is there correlation with missing values? for example, do we see a positive correlation between missing values and player performance (measured by number of routes run)
+```{r}
+
+route_runners_combine$missing40yd <- ifelse(is.na(route_runners_combine$X40yd), 1, 0)
+route_runners_combine$missing3Cone <- ifelse(is.na(route_runners_combine$X3Cone), 1, 0)
+route_runners_combine$missingShuttle <- ifelse(is.na(route_runners_combine$Shuttle), 1, 0)
+
+```
+
+
+```{r}
+cor_matrix <- cor(route_runners_combine %>% select(where(is.numeric)), use = "pairwise.complete.obs")
+
+pdf("Pre Exploratory Graphs/correlation_plot.pdf")
+corrplot(cor_matrix, method = "circle")
+
+dev.off()
+
+corrplot(cor_matrix, method = "circle")
+
+```
+
+our first data set is 'route_runners_combine' which is all route runners and their combine stats, with this we will likely do separate analysis on each combine stat in a way to deal with missing values)
+
+our second data set is 'imputed_rr_combine' which includes only route runners who have 2 or less missing combine values, then all the missing values are imputed
+```{r}
+
+route_runners_combine
+
+write.csv(route_runners_combine, "data/route_runners_combine.csv", row.names = FALSE)
+
+imputed_rr_combine 
+
+```
+
+
+
+```{r}
+player_aggregated_openess <- read.csv('data/player_aggregated2.csv')
+
+
+player_aggregated_openess_9 <- read.csv('9_week_player_aggregated.csv')
+
+hist(player_aggregated_openess$mean)
+hist(player_aggregated_openess_9$mean)
+```
+  
+
+```{r}
+  
+double_mean_openess_and_combine <- right_join(
+    x = player_aggregated_openess_9,
+    y = imputed_rr_combine,
+    by = c('nflId'),
+) %>% filter(count >= 1) %>% select(-c('n_routes'))
+  
+write.csv(double_mean_openess_and_combine, "data/double_mean_openess_and_scaled_combine.csv", row.names = FALSE)
+  
+```
+  
+```{r}
+  
+df_wr <- double_mean_openess_and_combine %>% filter(position_WR == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+df_rb <- double_mean_openess_and_combine %>% filter(position_RB == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+df_te <- double_mean_openess_and_combine %>% filter(position_TE == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+  
+vif(lm(mean ~ weight + X40yd + X3Cone + Shuttle + total_inches, data = df_wr))
+  
+vif(lm(mean ~ weight + X40yd + X3Cone + Shuttle + total_inches, data = df_rb))
+  
+vif(lm(mean ~ weight + X40yd + X3Cone + Shuttle + total_inches, data = df_te))
+  
+hist(double_mean_openess_and_combine$mean)
+  
+  
+model_wr <- lm(mean ~ . - 1 - nflId - count - displayName, data = df_wr, weights = count)
+model_rb <- lm(mean ~ . - 1 - nflId - count - displayName, data = df_rb, weights = count)
+model_te <- lm(mean ~ . - 1 - nflId - count - displayName, data = df_te, weights = count)
+
+summary(model_wr)
+
+summary(model_rb)
+
+summary(model_te)
+
+par(mfrow = c(2, 2))
+plot(model_wr, main = "Diagnostics for WR Model")
+plot(model_rb, main = "Diagnostics for RB Model")
+plot(model_te, main = "Diagnostics for TE Model")
+
+# we may need to look into fixing heteroscedasticity, scale location plot looks very bad
+# could scale y values?
+
+
+
+```
+
+
+sensitiviy analysis
+```{r}
+
+double_mean_openess_and_full_combine <- right_join(
+  x = player_aggregated_openess_9,
+  y = full_data_players,
+  by = c('nflId'),
+) %>% filter(count >= 1) %>% select(-c("n_routes"))
+
+
+df_full_wr <- double_mean_openess_and_full_combine %>% filter(position_WR == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+df_full_rb <- double_mean_openess_and_full_combine %>% filter(position_RB == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+df_full_te <- double_mean_openess_and_full_combine %>% filter(position_TE == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+
+vif(lm(mean ~ weight + X40yd + X3Cone + Shuttle + total_inches, data = df_full_wr))
+
+vif(lm(mean ~ weight + X40yd + X3Cone + Shuttle + total_inches, data = df_full_rb))
+
+vif(lm(mean ~ weight + X40yd + X3Cone + Shuttle + total_inches, data = df_full_te))
+
+hist(double_mean_openess_and_full_combine$mean)
+
+model_full_wr <- lm(mean ~ . - 1 - nflId - count - displayName, data = df_full_wr, weights = count)
+model_full_rb <- lm(mean ~ . - 1 - nflId - count - displayName, data = df_full_rb, weights = count)
+model_full_te <- lm(mean ~ . - 1 - nflId - count - displayName, data = df_full_te, weights = count)
+
+
+summary(model_full_wr)
+
+summary(model_full_rb)
+
+summary(model_full_te)
+
+
+
+```
+
+
+```{r}
+
+tidy_all <- rbind(
+  tidy_wr %>% mutate(position = "WR"),
+  tidy_rb %>% mutate(position = "RB"),
+  tidy_te %>% mutate(position = "TE")
+) %>%
+  mutate(significant = p.value < 0.05/15)
+
+# Plot
+p <- ggplot(tidy_all, aes(x = term, y = estimate, color = position, group = position)) +
+  geom_point(aes(shape = significant), position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(
+    aes(ymin = estimate - 1.96 * std.error, ymax = estimate + 1.96 * std.error),
+    width = 0.2,
+    position = position_dodge(width = 0.6)
+  ) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1)) +  # filled = sig, hollow = not
+  coord_flip() +
+  labs(
+    title = "Simple LM Regression Coefficients by Position",
+    subtitle = "Filled dots indicate p < 0.05",
+    x = "Predictor",
+    y = "Estimated Coefficient",
+    shape = "Significant"
+  ) +
+  theme_minimal()
+
+p
+
+# Save plot
+ggsave("Pre Exploratory Graphs/LM_regression_coefficients_by_position.png", plot = p, width = 8, height = 6, dpi = 300)
+
+
+```
+
+```{r}
+
+
+
+```
+
+
+```{r}
+player_per_play_openess <- read.csv('data/play_aggregated2.csv')
+
+player_per_play_openess_9 <- read.csv('9_week_play_aggregated.csv')
+
+```
+
+
+
+```{r}
+
+player_combine_opennes_per_play <- left_join(
+  x = player_per_play_openess_9,
+  y = imputed_rr_combine,
+  by = "nflId",
+) %>% filter(n_routes >= 1)
+
+
+player_combine_opennes_per_play <- left_join(
+  x = player_combine_opennes_per_play,
+  y = player_play,
+  by = c('gameId','playId','nflId'),
+) %>% select(c('openness','position_RB','position_TE','position_WR',"weight","X40yd","X3Cone","Shuttle","total_inches","routeRan","nflId"))
+
+#player_combine_opennes_per_play <- dummy_cols(player_combine_opennes_per_play, select_columns = "routeRan", remove_first_dummy = F, remove_selected_columns = T)
+
+double_mean_openess_by_route_and_combine <- player_combine_opennes_per_play %>%
+  group_by(nflId, routeRan) %>%
+  summarise(openness = mean(openness),
+            count = n()) %>% 
+  left_join(player_combine_opennes_per_play %>% 
+              distinct(nflId, routeRan, .keep_all = T),
+              by = c("nflId","routeRan")) %>% 
+  select(-c(openness.y)) %>% 
+  rename(openness = "openness.x")
+
+```
+
+
+```{r}
+# TODO find better cutoff to midigate p hacking
+df_wr <- double_mean_openess_by_route_and_combine %>% filter(position_WR == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+df_wr %>% group_by(routeRan) %>%
+  count(routeRan, sort = TRUE)
+
+top_routes <- df_wr %>%
+  group_by(routeRan) %>% 
+  count(routeRan, sort = TRUE) %>% 
+  filter(n > 90) %>% 
+  pull(routeRan)
+
+
+route_models <- top_routes %>%
+  set_names() %>%
+  map(function(route) {
+    df_wr %>%
+      filter(routeRan == route) %>%
+      select(-routeRan) %>%
+      lm(openness ~ . - 1 - nflId - count, data = ., weights = count)
+  })
+
+model_summaries <- route_models %>%
+  map_df(tidy, .id = "route")
+
+
+all_terms <- model_summaries %>% distinct(term) %>% pull(term)
+all_routes <- model_summaries %>% distinct(route) %>% pull(route)
+full_grid <- expand.grid(route = all_routes, term = all_terms, stringsAsFactors = FALSE)
+
+# 2. Join and fill missing values with NA
+model_summaries_complete <- full_grid %>%
+  left_join(model_summaries, by = c("route", "term")) %>%
+  mutate(significant = ifelse(is.na(p.value), FALSE, p.value < 0.05 / 25))
+
+# 3. Plot
+wr_model_summaries_route <- ggplot(model_summaries_complete, aes(x = term, y = estimate, color = route, group = route)) +
+  geom_point(aes(shape = significant), position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(
+    aes(ymin = estimate - std.error, ymax = estimate + std.error),
+    position = position_dodge(width = 0.6),
+    width = 0.2
+  ) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1)) +
+  labs(
+    title = "Wide Receiver Coefficient Estimates by Route Type (>90 routes ran)",
+    subtitle = "Filled dots indicate p < .05/25",
+    x = "Predictor",
+    y = "Estimate ± SE",
+    shape = "Significant"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+ggsave("Pre Exploratory Graphs/LM_regression_coefficients_WR_by_routeRan.png", plot = wr_model_summaries_route, width = 8, height = 6, dpi = 300)
+
+
+df_rb <- double_mean_openess_by_route_and_combine %>% filter(position_RB == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+df_rb %>% group_by(routeRan) %>%
+  count(routeRan, sort = TRUE)
+
+top_routes <- df_rb %>%
+  group_by(routeRan) %>% 
+  count(routeRan, sort = TRUE) %>% 
+  filter(n > 45) %>% 
+  pull(routeRan)
+
+
+route_models <- top_routes %>%
+  set_names() %>%
+  map(function(route) {
+    df_rb %>%
+      filter(routeRan == route) %>%
+      select(-routeRan) %>%
+      lm(openness ~ . - 1 - nflId - count, data = ., weights = count)
+  })
+
+model_summaries <- route_models %>%
+  map_df(tidy, .id = "route")
+
+all_terms <- model_summaries %>% distinct(term) %>% pull(term)
+all_routes <- model_summaries %>% distinct(route) %>% pull(route)
+full_grid <- expand.grid(route = all_routes, term = all_terms, stringsAsFactors = FALSE)
+
+# 2. Join and fill missing values with NA
+model_summaries_complete <- full_grid %>%
+  left_join(model_summaries, by = c("route", "term")) %>%
+  mutate(significant = ifelse(is.na(p.value), FALSE, p.value < 0.05 / 25))
+
+# 3. Plot
+rb_model_summaries_route <- ggplot(model_summaries_complete, aes(x = term, y = estimate, color = route, group = route)) +
+  geom_point(aes(shape = significant), position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(
+    aes(ymin = estimate - std.error, ymax = estimate + std.error),
+    position = position_dodge(width = 0.6),
+    width = 0.2
+  ) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1)) +
+  labs(
+    title = "Running Back Coefficient Estimates by Route Type (>45 routes ran)",
+    subtitle = "Filled dots indicate p < 0.05/25",
+    x = "Predictor",
+    y = "Estimate ± SE",
+    shape = "Significant"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("Pre Exploratory Graphs/LM_regression_coefficients_RB_by_routeRan.png", plot = rb_model_summaries_route, width = 8, height = 6, dpi = 300)
+
+
+df_te <- double_mean_openess_by_route_and_combine %>% filter(position_TE == 1) %>% select(-c("position_RB","position_TE","position_WR"))
+df_te %>% group_by(routeRan) %>%
+  count(routeRan, sort = TRUE)
+
+top_routes <- df_te %>%
+  group_by(routeRan) %>% 
+  count(routeRan, sort = TRUE) %>% 
+  filter(n > 50) %>% 
+  pull(routeRan)
+
+
+route_models <- top_routes %>%
+  set_names() %>%
+  map(function(route) {
+    df_te %>%
+      filter(routeRan == route) %>%
+      select(-routeRan) %>%
+      lm(openness ~ . - 1 - nflId - count, data = ., weights = count)
+  })
+
+model_summaries <- route_models %>%
+  map_df(tidy, .id = "route")
+
+
+all_terms <- model_summaries %>% distinct(term) %>% pull(term)
+all_routes <- model_summaries %>% distinct(route) %>% pull(route)
+full_grid <- expand.grid(route = all_routes, term = all_terms, stringsAsFactors = FALSE)
+
+# 2. Join and fill missing values with NA
+model_summaries_complete <- full_grid %>%
+  left_join(model_summaries, by = c("route", "term")) %>%
+  mutate(significant = ifelse(is.na(p.value), FALSE, p.value < 0.05 / 25))
+
+# 3. Plot
+te_model_summaries_route <- ggplot(model_summaries_complete, aes(x = term, y = estimate, color = route, group = route)) +
+  geom_point(aes(shape = significant), position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(
+    aes(ymin = estimate - std.error, ymax = estimate + std.error),
+    position = position_dodge(width = 0.6),
+    width = 0.2
+  ) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1)) +
+  labs(
+    title = "Tight End Coefficient Estimates by Route Type (>50 routes ran)",
+    subtitle = "Filled dots indicate p < 0.05/25",
+    x = "Predictor",
+    y = "Estimate ± SE",
+    shape = "Significant"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("Pre Exploratory Graphs/LM_regression_coefficients_TE_by_routeRan.png", plot = te_model_summaries_route, width = 8, height = 6, dpi = 300)
+
+```
+
+
+```{r}
+
+wr_model_summaries_route
+rb_model_summaries_route
+te_model_summaries_route
+
+```
